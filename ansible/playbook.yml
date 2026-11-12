@@ -119,6 +119,15 @@
         mode: "0600"
       tags: setup
 
+    # The k3s-bundled kubectl ignores ~/.kube/config unless KUBECONFIG is set.
+    # /etc/environment is read by PAM, so it also covers `ssh host kubectl ...`.
+    - name: Point kubectl at the SSH user's kubeconfig
+      ansible.builtin.lineinfile:
+        path: /etc/environment
+        regexp: '^KUBECONFIG='
+        line: "KUBECONFIG=/home/{{ ansible_user }}/.kube/config"
+      tags: setup
+
     - name: Wait for the Kubernetes node to be Ready
       ansible.builtin.command: "{{ kubectl }} wait --for=condition=Ready node --all --timeout=180s"
       changed_when: false
