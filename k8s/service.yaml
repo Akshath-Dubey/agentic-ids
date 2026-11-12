@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentic-ids
+  namespace: agentic-ids
+spec:
+  type: ClusterIP
+  selector:
+    app: agentic-ids
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

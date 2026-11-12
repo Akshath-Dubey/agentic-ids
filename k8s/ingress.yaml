@@ -1,0 +1,20 @@
+# Uses the Traefik ingress controller bundled with K3s, which listens on the
+# host's port 80. This makes the dashboard reachable at http://<EC2_PUBLIC_IP>
+# without an AWS load balancer. Traefik proxies Streamlit's WebSocket natively.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agentic-ids
+  namespace: agentic-ids
+spec:
+  ingressClassName: traefik
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: agentic-ids
+                port:
+                  name: http

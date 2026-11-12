@@ -1,0 +1,11 @@
+# Runtime dependencies for the Streamlit dashboard (app.py) and agents.
+streamlit==1.67.0
+pandas==3.1.1
+numpy==2.5.4
+scikit-learn==1.9.1
+matplotlib==3.11.2
+# CPU-only XGBoost build (same `xgboost` module, without the ~300MB CUDA/NCCL wheels).
+# DetectionAgent falls back to HistGradientBoostingClassifier if it is missing.
+xgboost-cpu==3.4.1
+# Used by main.py (SMOTE)
+imbalanced-learn==0.14.2

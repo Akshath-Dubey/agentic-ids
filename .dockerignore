@@ -1,0 +1,16 @@
+.git
+.github
+**/__pycache__
+**/*.pyc
+.venv
+venv
+.env
+*.env
+terraform
+ansible
+k8s
+tests
+data
+*.md
+Dockerfile
+.dockerignore

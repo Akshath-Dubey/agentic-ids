@@ -1,0 +1,143 @@
+name: CI/CD - Build and Deploy to AWS (K3s)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  REGISTRY: ghcr.io
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Byte-compile all sources
+        run: python -m compileall -q app.py main.py agents utils
+
+      - name: Smoke test agent pipeline
+        run: pytest -q tests
+
+  build:
+    name: Build and push image
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image name
+        id: meta
+        run: |
+          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "repo=${REGISTRY}/${owner}/agentic-ids" >> "$GITHUB_OUTPUT"
+          echo "image=${REGISTRY}/${owner}/agentic-ids:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Container startup check
+        run: |
+          docker run -d --name ids -p 8501:8501 "${{ steps.meta.outputs.image }}"
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8501/_stcore/health; then echo; exit 0; fi
+            sleep 2
+          done
+          docker logs ids
+          exit 1
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image (sha + latest)
+        if: github.event_name != 'pull_request'
+        run: |
+          docker tag "${{ steps.meta.outputs.image }}" "${{ steps.meta.outputs.repo }}:latest"
+          docker push "${{ steps.meta.outputs.image }}"
+          docker push "${{ steps.meta.outputs.repo }}:latest"
+
+  deploy:
+    name: Deploy to EC2 (K3s)
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: http://${{ vars.EC2_HOST }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Ansible
+        run: pip install ansible-core
+
+      - name: Configure SSH key and inventory
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          test -n "$EC2_HOST" && test -n "$EC2_SSH_KEY" || { echo "::error::Set the EC2_HOST repository variable and EC2_SSH_KEY repository secret"; exit 1; }
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/agentic-ids && chmod 600 ~/.ssh/agentic-ids
+          printf '[k3s]\n%s ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/agentic-ids\n' "$EC2_HOST" > ansible/inventory.ini
+
+      - name: Deploy with Ansible
+        working-directory: ansible
+        env:
+          # A PAT with read:packages keeps the node able to re-pull after the
+          # job token expires; falls back to the short-lived job token.
+          GHCR_TOKEN: ${{ secrets.GHCR_PULL_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          ansible-playbook playbook.yml --tags deploy \
+            -e app_image="${{ needs.build.outputs.image }}" \
+            -e upgrade_packages=false \
+            -e ghcr_username="${{ github.actor }}" \
+            -e ghcr_token="$GHCR_TOKEN"
+
+      - name: Public endpoint check
+        run: |
+          for i in $(seq 1 12); do
+            if curl -fsS "http://${{ vars.EC2_HOST }}/_stcore/health"; then echo; exit 0; fi
+            sleep 5
+          done
+          exit 1

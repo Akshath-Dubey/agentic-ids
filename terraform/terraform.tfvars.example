@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars and adjust. terraform.tfvars is git-ignored.
+aws_region          = "ap-south-1"
+instance_name       = "agentic-ids"
+instance_type       = "t3.small" # t3.medium for large CSV uploads
+ami_id              = "" # empty = latest Ubuntu 24.04 LTS
+root_volume_size    = 20
+ssh_key_name        = "agentic-ids-key"
+ssh_public_key_path = "~/.ssh/agentic-ids.pub"
+
+# CI/CD deploys over SSH from GitHub-hosted runners, so 22 must stay reachable.
+# For manual-only deploys you can lock this down to ["<your-ip>/32"].
+ssh_allowed_cidrs  = ["0.0.0.0/0"]
+http_allowed_cidrs = ["0.0.0.0/0"]
