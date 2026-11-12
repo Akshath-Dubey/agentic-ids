@@ -11,3 +11,7 @@ ssh_public_key_path = "~/.ssh/agentic-ids.pub"
 # For manual-only deploys you can lock this down to ["<your-ip>/32"].
 ssh_allowed_cidrs  = ["0.0.0.0/0"]
 http_allowed_cidrs = ["0.0.0.0/0"]
+
+# Email alerts (CloudWatch -> SNS). Confirm the subscription link AWS emails you.
+alert_email         = "you@example.com"
+cpu_alarm_threshold = 80

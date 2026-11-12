@@ -17,3 +17,8 @@ ansible/inventory.ini
 
 # Local Ansible cache
 .ansible/
+
+# Test coverage / SonarQube scanner
+.coverage
+coverage.xml
+.scannerwork/

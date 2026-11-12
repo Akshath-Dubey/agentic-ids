@@ -14,3 +14,7 @@ data
 *.md
 Dockerfile
 .dockerignore
+coverage.xml
+.coverage
+.scannerwork
+sonar-project.properties

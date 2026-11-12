@@ -35,3 +35,13 @@ output "ansible_inventory" {
     ${aws_eip.app.public_ip} ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/agentic-ids
   EOT
 }
+
+output "alerts_topic_arn" {
+  description = "SNS topic that receives CloudWatch alarm notifications"
+  value       = aws_sns_topic.alerts.arn
+}
+
+output "cpu_alarm_name" {
+  description = "Name of the high-CPU CloudWatch alarm"
+  value       = aws_cloudwatch_metric_alarm.cpu_high.alarm_name
+}

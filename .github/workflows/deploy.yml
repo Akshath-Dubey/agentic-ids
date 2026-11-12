@@ -19,8 +19,13 @@ jobs:
   validate:
     name: Validate
     runs-on: ubuntu-latest
+    env:
+      # Secrets can't be referenced in `if:` directly; the scan is skipped until this is set.
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history for SonarQube blame / new-code detection
 
       - uses: actions/setup-python@v5
         with:
@@ -30,13 +35,25 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install pytest
+          pip install pytest pytest-cov
 
       - name: Byte-compile all sources
         run: python -m compileall -q app.py main.py agents utils
 
-      - name: Smoke test agent pipeline
-        run: python -m pytest -q tests
+      - name: Smoke test agent pipeline (with coverage)
+        run: python -m pytest -q tests --cov=. --cov-report=xml:coverage.xml
+
+      - name: SonarQube Cloud scan + quality gate
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@v8.4.1
+        with:
+          args: >
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+
+      - name: SonarQube skipped notice
+        if: env.SONAR_TOKEN == ''
+        run: echo "::warning::SONAR_TOKEN secret not set - SonarQube scan skipped"
 
   build:
     name: Build and push image

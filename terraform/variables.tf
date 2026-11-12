@@ -51,3 +51,15 @@ variable "http_allowed_cidrs" {
   type        = list(string)
   default     = ["0.0.0.0/0"]
 }
+
+variable "alert_email" {
+  description = "Email address that receives CloudWatch alarm notifications. Leave empty to create the alarms without an email subscription."
+  type        = string
+  default     = ""
+}
+
+variable "cpu_alarm_threshold" {
+  description = "Average CPU percentage (over 5 minutes) that triggers the high-CPU alert."
+  type        = number
+  default     = 80
+}

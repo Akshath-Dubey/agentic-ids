@@ -37,6 +37,8 @@ GitHub Actions ── validate (compile + pytest) ── docker build + containe
 | Container | Docker: `python:3.12-slim`, non-root, `streamlit run app.py` on :8501 | `Dockerfile` |
 | Orchestration | Kubernetes (K3s, single node) | `k8s/` |
 | CI/CD | GitHub Actions + GitHub Container Registry | `.github/workflows/deploy.yml` |
+| Code quality | SonarQube Cloud (scan + quality gate in CI) | `sonar-project.properties` |
+| Alerts | CloudWatch alarms → SNS → email (CPU > 80%, status check failed) | `terraform/alerts.tf` |
 
 ## Repository structure
 
@@ -48,7 +50,8 @@ utils/preprocess.py     Feature preprocessing
 models/model.pkl        Saved model (not loaded by app.py)
 tests/test_smoke.py     End-to-end agent pipeline smoke test
 Dockerfile, .dockerignore, .streamlit/config.toml
-terraform/              main.tf, variables.tf, outputs.tf, providers.tf, terraform.tfvars.example
+sonar-project.properties  SonarQube Cloud analysis settings
+terraform/              main.tf, alerts.tf, variables.tf, outputs.tf, providers.tf, terraform.tfvars.example
 ansible/                playbook.yml, ansible.cfg, inventory.ini.example
 k8s/                    namespace, configmap, deployment, service, ingress, secret.example
 .github/workflows/deploy.yml
@@ -56,7 +59,7 @@ k8s/                    namespace, configmap, deployment, service, ingress, secr
 
 ## Prerequisites
 
-- AWS account and an IAM user/role that can manage EC2, security groups, key pairs and Elastic IPs
+- AWS account and an IAM user/role that can manage EC2, security groups, key pairs, Elastic IPs, SNS topics and CloudWatch alarms
 - AWS CLI configured (`aws configure`), Terraform ≥ 1.5, Docker
 - Ansible (`pip install ansible-core`). It needs a Linux/macOS control node, so on Windows use WSL or the Docker command below.
 - A GitHub repository with Actions enabled
@@ -122,7 +125,7 @@ The Deployment runs 1 replica as a non-root user, with readiness and liveness pr
 
 On every push to `main`:
 
-1. **Validate**: install requirements, byte-compile, run `pytest`
+1. **Validate**: install requirements, byte-compile, run `pytest` with coverage, then a SonarQube Cloud scan. The job fails if the quality gate fails, which blocks the deploy.
 2. **Build**: build the Docker image and confirm the container answers `/_stcore/health`
 3. **Publish**: push `ghcr.io/<owner>/agentic-ids:<commit-sha>` and `:latest` to GHCR
 4. **Deploy**: Ansible (`--tags deploy`) sets the new image and waits for the rollout to finish
@@ -138,7 +141,42 @@ Pull requests run steps 1 and 2 only. To roll back, re-run an earlier successful
 | `EC2_SSH_KEY` | Secret | contents of `~/.ssh/agentic-ids` (private key) |
 | `GHCR_PULL_TOKEN` | Secret (optional) | PAT with `read:packages`, so the node can re-pull a private image after the job token expires. Not needed if the GHCR package is public. |
 
+| `SONAR_TOKEN` | Secret | SonarQube Cloud token. Until it's set, the scan is skipped with a warning. |
+
 `GITHUB_TOKEN` (built in) is used to push to GHCR, so no AWS keys are needed in GitHub.
+
+## 6. SonarQube Cloud (code quality)
+
+1. Sign in at https://sonarcloud.io with GitHub, then choose **+ → Analyze new project** and import `agentic-ids`.
+2. In the project, go to **Administration → Analysis Method** and turn **off Automatic Analysis**, since CI does the analysis.
+3. Go to **My Account → Security** and generate a token. Add it as the `SONAR_TOKEN` repository secret.
+4. If the organization or project keys differ from the ones in `sonar-project.properties`, update them.
+
+Each push then sends bugs, vulnerabilities, code smells, duplication and test coverage (from `pytest --cov`) to the SonarQube dashboard. The pipeline waits for the quality gate.
+
+## 7. Email alerts (CloudWatch → SNS)
+
+`terraform/alerts.tf` creates:
+
+| Alarm | Fires when | Email |
+|---|---|---|
+| `agentic-ids-cpu-above-80pct` | Average EC2 CPU > 80% over 5 minutes | ALARM, then OK when it recovers |
+| `agentic-ids-status-check-failed` | EC2 instance/system status check fails for 2 minutes | ALARM, then OK |
+
+Set `alert_email` in `terraform.tfvars` and run `terraform apply`. **AWS then emails a confirmation link, and you must click it before any alerts arrive.** It uses free basic EC2 metrics, so there's no agent on the server.
+
+To test without loading the CPU:
+
+```bash
+aws cloudwatch set-alarm-state --region ap-south-1 --alarm-name agentic-ids-cpu-above-80pct \
+  --state-value ALARM --state-reason "Manual test"
+```
+
+To test with real load, run this on the server (high CPU for 6 minutes; the alarm fires within about 10 minutes):
+
+```bash
+sudo apt-get install -y stress-ng && stress-ng --cpu 2 --timeout 360s
+```
 
 ## Public application URL
 
@@ -174,7 +212,7 @@ curl -i http://<EC2_IP>/_stcore/health
 
 ```bash
 cd terraform
-terraform destroy          # removes the EC2 instance, Elastic IP, security group and key pair
+terraform destroy          # removes the EC2 instance, Elastic IP, security group, key pair, alarms and SNS topic
 ```
 
 You can also delete the `agentic-ids` package under GitHub → Packages.
