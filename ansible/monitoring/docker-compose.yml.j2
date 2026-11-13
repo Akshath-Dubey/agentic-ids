@@ -1,0 +1,93 @@
+# Managed by Ansible - Agentic IDS tools server.
+# Secrets come from the .env file next to this one (mode 0600, never committed).
+name: monitoring
+
+services:
+  prometheus:
+    image: prom/prometheus:{{ prometheus_version }}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports: ["9090:9090"]
+    restart: unless-stopped
+    mem_limit: 512m
+
+  alertmanager:
+    image: prom/alertmanager:{{ alertmanager_version }}
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.external-url=http://{{ tools_public_ip }}:9093
+    volumes:
+      - ./alertmanager:/etc/alertmanager:ro
+      - alertmanager-data:/alertmanager
+    ports: ["9093:9093"]
+    restart: unless-stopped
+    mem_limit: 128m
+
+  blackbox:
+    image: prom/blackbox-exporter:{{ blackbox_version }}
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    volumes:
+      - ./blackbox:/etc/blackbox:ro
+    restart: unless-stopped
+    mem_limit: 64m
+
+  grafana:
+    image: grafana/grafana:{{ grafana_version }}
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_SERVER_ROOT_URL: http://{{ tools_public_ip }}:3000
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/agentic-ids-overview.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["3000:3000"]
+    restart: unless-stopped
+    mem_limit: 384m
+
+  sonar-db:
+    image: postgres:{{ postgres_version }}
+    environment:
+      POSTGRES_USER: sonar
+      POSTGRES_PASSWORD: ${SONAR_DB_PASSWORD}
+      POSTGRES_DB: sonar
+    volumes:
+      - sonar-db-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    mem_limit: 384m
+
+  sonarqube:
+    image: sonarqube:{{ sonarqube_version }}
+    depends_on: [sonar-db]
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://sonar-db:5432/sonar
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_JDBC_PASSWORD: ${SONAR_DB_PASSWORD}
+    volumes:
+      - sonarqube-data:/opt/sonarqube/data
+      - sonarqube-extensions:/opt/sonarqube/extensions
+      - sonarqube-logs:/opt/sonarqube/logs
+    ulimits:
+      nofile: { soft: 131072, hard: 131072 }
+      nproc: 8192
+    ports: ["9000:9000"]
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
+  sonar-db-data:
+  sonarqube-data:
+  sonarqube-extensions:
+  sonarqube-logs:

@@ -10,90 +10,148 @@ A multi-agent intrusion detection system with a Streamlit dashboard. Upload CICI
 | Response | `agents/response_agent.py` | Chooses mitigation actions |
 | Learning | `agents/learning_agent.py` | Retrains on new data ("Auto Learn") |
 
-It's deployed on AWS: **http://13.203.254.194**
+## Live endpoints (AWS ap-south-1)
+
+| Service | URL | Access |
+|---|---|---|
+| **Agentic IDS dashboard** | http://13.203.254.194 | Public |
+| Grafana | http://15.252.117.69:3000 | `admin` / `ansible/credentials/grafana_admin_password` |
+| SonarQube | http://15.252.117.69:9000 | `admin` / `ansible/credentials/sonar_admin_password` + `#Aa1` |
+| Prometheus | http://15.252.117.69:9090 | Admin IPs only (`admin_cidrs`) |
+| Alertmanager | http://15.252.117.69:9093 | Admin IPs only (`admin_cidrs`) |
 
 ## Architecture
 
 ```
-git push (main)
-   │
-   ▼
-GitHub Actions ── validate (compile + pytest) ── docker build + container health check ── push to GHCR
-                                                                                            │
-                                                                     Ansible over SSH ◄─────┘
-                                                                            │
-                                                                            ▼
-                 Browser ──► http://<EC2_IP>:80 ──► Traefik ingress ──► Service ──► Pod (Streamlit :8501)
-                                                   └──────────── K3s on one EC2 instance ────────────┘
+                 git push (main)
+                       │
+                       ▼
+  GitHub Actions: pytest + coverage ─► SonarQube scan + quality gate ─► docker build + health check
+                                         (tools server :9000)              │
+                                                                           ▼
+                                                              push ghcr.io/<owner>/agentic-ids:<sha>
+                                                                           │
+                                                                Ansible over SSH (rollout)
+                                                                           ▼
+ ┌──────────────────────── AWS default VPC, ap-south-1 ─────────────────────────────────────────┐
+ │                                                                                              │
+ │   K3s cluster (security group "agentic-ids-sg")                                             │
+ │   ┌──────────────────────────────┐      private network     ┌─────────────────────────────┐  │
+ │   │ agentic-ids  (t3.small)      │◄── 6443 / 8472 / 10250 ─►│ agentic-ids-worker-1        │  │
+ │   │ K3s server (control plane)   │                          │ (t3.small) K3s agent        │  │
+ │   │ Traefik :80  ─► app pod #1   │                          │ Traefik :80 ─► app pod #2   │  │
+ │   │ kube-state-metrics :30080    │                          │                             │  │
+ │   │ node_exporter :9100          │                          │ node_exporter :9100         │  │
+ │   └──────────────▲───────────────┘                          └──────────────▲──────────────┘  │
+ │      Elastic IP  │ 13.203.254.194                                          │                 │
+ │                  │                 scrape 9100 / 30080, probe :80          │                 │
+ │   ┌──────────────┴─────────────────────────────────────────────────────────┴──────────────┐  │
+ │   │ agentic-ids-tools (c7i-flex.large, 4 GiB) — Docker Compose          EIP 15.252.117.69 │  │
+ │   │ Prometheus :9090 ─► Alertmanager :9093 ─► email (Gmail SMTP)                          │  │
+ │   │ Grafana :3000   Blackbox exporter   SonarQube :9000 + PostgreSQL   node_exporter      │  │
+ │   └───────────────────────────────────────────────────────────────────────────────────────┘  │
+ └──────────────────────────────────────────────────────────────────────────────────────────────┘
+        Browser ─► http://13.203.254.194 ─► Traefik ─► Service (sticky cookie) ─► one of 2 pods
 ```
 
 ## Technology stack
 
 | Layer | Tool | Location |
 |---|---|---|
-| Cloud | AWS: 1× EC2 (t3.small, Ubuntu 24.04), security group, key pair, Elastic IP, default VPC | `terraform/` |
+| Cloud | AWS: 3× EC2 (Ubuntu 24.04), 2 security groups, key pair, 2 Elastic IPs, default VPC | `terraform/` |
 | Infrastructure as code | Terraform | `terraform/` |
-| Server configuration | Ansible: packages, swap, SSH hardening, K3s, kubectl, app rollout | `ansible/playbook.yml` |
+| Configuration management | Ansible: hardening, swap, node_exporter, K3s server + agent, monitoring stack, SonarQube bootstrap, app rollout | `ansible/` |
 | Container | Docker: `python:3.12-slim`, non-root, `streamlit run app.py` on :8501 | `Dockerfile` |
-| Orchestration | Kubernetes (K3s, single node) | `k8s/` |
+| Orchestration | Kubernetes (K3s): 2 nodes, app with 2 replicas | `k8s/` |
 | CI/CD | GitHub Actions + GitHub Container Registry | `.github/workflows/deploy.yml` |
-| Code quality | SonarQube Cloud (scan + quality gate in CI) | `sonar-project.properties` |
-| Alerts | CloudWatch alarms → SNS → email (CPU > 80%, status check failed) | `terraform/alerts.tf` |
+| Code quality | SonarQube Community (self-hosted on AWS), quality gate blocks deploys | `sonar-project.properties` |
+| Metrics | Prometheus + node_exporter + kube-state-metrics + blackbox exporter | `ansible/monitoring/` |
+| Dashboards | Grafana ("Agentic IDS - Overview", "Node Exporter Full") | `ansible/monitoring/grafana/` |
+| Alerts | Prometheus rules → Alertmanager → email | `ansible/monitoring/alert-rules.yml` |
+
+### The three instances
+
+| Name | Type | Role | Why it's separate |
+|---|---|---|---|
+| `agentic-ids` | t3.small (2 vCPU, 2 GiB) | K3s server: control plane, Traefik, one app replica | Holds the public dashboard IP |
+| `agentic-ids-worker-1` | t3.small (2 vCPU, 2 GiB) | K3s agent: second app replica | If one node fails, the app keeps running on the other, and load is spread across both |
+| `agentic-ids-tools` | c7i-flex.large (2 vCPU, 4 GiB) | Prometheus, Alertmanager, Grafana, SonarQube | Monitoring must stay up when the cluster is down, and SonarQube needs ~2 GiB that would starve the app |
+
+The tools server uses c7i-flex.large because this AWS account is on the Free Tier plan, which blocks t3.medium. On a normal account, `tools_instance_type = "t3.medium"` is cheaper.
 
 ## Repository structure
 
 ```
-app.py                  Streamlit dashboard (the deployed entry point)
-main.py                 Offline training script (not used by the deployment)
-agents/                 The five agents
-utils/preprocess.py     Feature preprocessing
-models/model.pkl        Saved model (not loaded by app.py)
-tests/test_smoke.py     End-to-end agent pipeline smoke test
+app.py                     Streamlit dashboard (the deployed entry point)
+main.py                    Offline training script (not used by the deployment)
+agents/                    The five agents
+utils/preprocess.py        Feature preprocessing
+models/model.pkl           Saved model (not loaded by app.py)
+tests/test_smoke.py        End-to-end agent pipeline smoke test
 Dockerfile, .dockerignore, .streamlit/config.toml
-sonar-project.properties  SonarQube Cloud analysis settings
-terraform/              main.tf, alerts.tf, variables.tf, outputs.tf, providers.tf, terraform.tfvars.example
-ansible/                playbook.yml, ansible.cfg, inventory.ini.example
-k8s/                    namespace, configmap, deployment, service, ingress, secret.example
+sonar-project.properties   SonarQube analysis settings
+terraform/
+  main.tf                  K3s server + worker instances, cluster security group, Elastic IP
+  tools.tf                 Tools instance, its security group and Elastic IP
+  alerts.tf                Optional CloudWatch/SNS alarms (enable_cloudwatch_alerts)
+  variables.tf, outputs.tf, providers.tf, terraform.tfvars.example
+ansible/
+  playbook.yml             Common setup, K3s server, K3s agents, monitoring stack, app deploy
+  monitoring/              Compose file, Prometheus config + alert rules, Alertmanager, Grafana
+  ansible.cfg, inventory.ini.example
+k8s/
+  namespace, configmap, deployment (2 replicas), service (sticky), ingress, secret.example
+  monitoring/kube-state-metrics.yaml
 .github/workflows/deploy.yml
 ```
 
 ## Prerequisites
 
-- AWS account and an IAM user/role that can manage EC2, security groups, key pairs, Elastic IPs, SNS topics and CloudWatch alarms
-- AWS CLI configured (`aws configure`), Terraform ≥ 1.5, Docker
+- An AWS account and an IAM user that can manage EC2, security groups, key pairs and Elastic IPs. It also needs SNS and CloudWatch permissions, but only for the optional CloudWatch alarms.
+- AWS CLI configured, Terraform ≥ 1.5, Docker
 - Ansible (`pip install ansible-core`). It needs a Linux/macOS control node, so on Windows use WSL or the Docker command below.
-- A GitHub repository with Actions enabled
+- A GitHub repository with Actions enabled, and the `gh` CLI for setting secrets
 
-## 1. AWS and Terraform (one time)
+## 1. Terraform: provision the 3 instances
 
 ```bash
 ssh-keygen -t ed25519 -N "" -f ~/.ssh/agentic-ids       # deploy key — never commit it
 cd terraform
-cp terraform.tfvars.example terraform.tfvars               # region, instance type, allowed CIDRs
+cp terraform.tfvars.example terraform.tfvars               # set alert_email, admin_cidrs = ["<your-ip>/32"]
 terraform init
 terraform fmt -check && terraform validate
 terraform plan -out tfplan
 terraform apply tfplan
-terraform output                                           # public_ip, public_dns, app_url, ssh_command
+terraform output                                           # app_url, grafana_url, sonarqube_url, ...
 terraform output -raw ansible_inventory > ../ansible/inventory.ini
 ```
 
-Defaults: `ap-south-1`, `t3.small`, 20 GB gp3, latest Ubuntu 24.04 AMI. AWS credentials come from your AWS CLI profile or environment and are never stored in the repo.
-
-## 2. Ansible: configure the server and install K3s (one time)
+## 2. Ansible: configure everything
 
 ```bash
 cd ansible
-ansible-playbook playbook.yml --tags setup                 # packages, swap, SSH hardening, K3s, kubectl
+export ALERT_SMTP_PASSWORD='<gmail app password>'          # optional: enables alert emails
+ansible-playbook playbook.yml --tags setup                 # all 3 servers, K3s cluster, monitoring, SonarQube
 ansible-playbook playbook.yml --tags deploy \
-  -e app_image=ghcr.io/<owner>/agentic-ids:latest          # optional first deploy (CI normally does this)
+  -e app_image=ghcr.io/<owner>/agentic-ids:latest          # first deploy (CI does this afterwards)
 ```
 
-Windows, via Docker:
+What each play does:
+
+1. **All instances**: package updates, key-only SSH, swap (2 GB, or 4 GB on tools), and node_exporter as a systemd service.
+2. **K3s server**: installs K3s, sets up kubectl access, and reads the join token and version.
+3. **K3s agents**: install the same K3s version and join over the private IP (`https://<server-private-ip>:6443`).
+4. **Cluster checks**: wait until every node is Ready, label the workers, check Traefik, and deploy kube-state-metrics.
+5. **Deploy** (`--tags deploy`): apply the manifests with the new image and wait for both replicas to roll out.
+6. **Tools**: Docker and Compose, the kernel settings SonarQube needs, then Prometheus, Alertmanager, blackbox exporter, Grafana (with provisioned dashboards), SonarQube and PostgreSQL. Finally it sets the SonarQube admin password and creates a CI token.
+
+Passwords are generated on the first run and saved to `ansible/credentials/`, which is git-ignored. The SonarQube CI token is saved to `credentials/sonar_token`.
+
+Windows, via Docker (run from the repo root):
 
 ```bash
-docker run --rm -v "$PWD/..:/work:ro" -v ~/.ssh/agentic-ids:/key:ro -w /work/ansible \
-  -e ANSIBLE_CONFIG=/work/ansible/ansible.cfg python:3.12-slim sh -c \
+docker run --rm -v "$PWD:/work" -v ~/.ssh/agentic-ids:/key:ro -w /work/ansible \
+  -e ANSIBLE_CONFIG=/work/ansible/ansible.cfg -e ALERT_SMTP_PASSWORD python:3.12-slim sh -c \
   "apt-get update -qq && apt-get install -y -qq openssh-client && pip install -q ansible-core && \
    mkdir -p /root/.ssh && cp /key /root/.ssh/agentic-ids && chmod 600 /root/.ssh/agentic-ids && \
    ansible-playbook playbook.yml --tags setup"
@@ -110,118 +168,139 @@ docker run --rm -p 8501:8501 agentic-ids                   # http://localhost:85
 
 ## 4. Kubernetes
 
-Ansible copies `k8s/` to the server, substitutes the image, and applies the manifests. To do it by hand on the server:
+- **2 replicas**, spread across the two nodes with `topologySpreadConstraints`.
+- **Sticky sessions**: Streamlit keeps each user's session in the memory of one pod. The Service's Traefik annotation sets an `ids_affinity` cookie, so a browser's WebSocket and file uploads always reach the same pod.
+- **Rolling updates** with `maxUnavailable: 0`, so a deploy never takes the app offline.
+- **Probes**: startup, readiness and liveness probes on `/_stcore/health`. The pods run non-root with seccomp and drop all capabilities.
+- **Resources**: each pod requests 200m CPU / 384Mi and is limited to 1.5 CPU / 1280Mi.
+- **Routing**: Traefik (bundled with K3s) listens on port 80 on both nodes. The Elastic IP points at the server node.
+
+Manual commands, run on the server:
 
 ```bash
-kubectl apply -f k8s/namespace.yaml -f k8s/configmap.yaml -f k8s/deployment.yaml \
-              -f k8s/service.yaml -f k8s/ingress.yaml
+kubectl get nodes -o wide
+kubectl -n agentic-ids get pods -o wide                    # one pod per node
 kubectl -n agentic-ids set image deployment/agentic-ids agentic-ids=ghcr.io/<owner>/agentic-ids:<sha>
 kubectl -n agentic-ids rollout status deployment/agentic-ids
+kubectl -n agentic-ids rollout undo deployment/agentic-ids # rollback
 ```
-
-The Deployment runs 1 replica as a non-root user, with readiness and liveness probes on `/_stcore/health`, a 200m/384Mi CPU/memory request and 1.5 CPU/1280Mi limit (sized for t3.small). Traefik, which ships with K3s, routes port 80 to the Service.
 
 ## 5. GitHub Actions CI/CD
 
 On every push to `main`:
 
-1. **Validate**: install requirements, byte-compile, run `pytest` with coverage, then a SonarQube Cloud scan. The job fails if the quality gate fails, which blocks the deploy.
-2. **Build**: build the Docker image and confirm the container answers `/_stcore/health`
-3. **Publish**: push `ghcr.io/<owner>/agentic-ids:<commit-sha>` and `:latest` to GHCR
-4. **Deploy**: Ansible (`--tags deploy`) sets the new image and waits for the rollout to finish
+1. **Validate**: install requirements, byte-compile, and run `pytest` with coverage. Then the **SonarQube scan** runs, and the job fails if the quality gate fails, which blocks the deploy.
+2. **Build**: build the Docker image and confirm the container answers `/_stcore/health`.
+3. **Publish**: push `ghcr.io/<owner>/agentic-ids:<commit-sha>` and `:latest` to GHCR.
+4. **Deploy**: Ansible (`--tags deploy`) on the K3s server rolls the new image out to both nodes.
 5. **Verify**: `curl http://$EC2_HOST/_stcore/health` from the runner. The job fails if the check fails.
 
-Pull requests run steps 1 and 2 only. To roll back, re-run an earlier successful workflow, or run `kubectl -n agentic-ids rollout undo deployment/agentic-ids`.
+Pull requests run steps 1 and 2 only.
 
-### Required secrets and variables (Settings → Secrets and variables → Actions)
+### Secrets and variables (Settings → Secrets and variables → Actions)
 
 | Name | Type | Value |
 |---|---|---|
 | `EC2_HOST` | Variable | `terraform output -raw public_ip` |
+| `SONAR_HOST_URL` | Variable | `terraform output -raw sonarqube_url` |
 | `EC2_SSH_KEY` | Secret | contents of `~/.ssh/agentic-ids` (private key) |
-| `GHCR_PULL_TOKEN` | Secret (optional) | PAT with `read:packages`, so the node can re-pull a private image after the job token expires. Not needed if the GHCR package is public. |
+| `SONAR_TOKEN` | Secret | contents of `ansible/credentials/sonar_token` |
+| `GHCR_PULL_TOKEN` | Secret (optional) | PAT with `read:packages`. Lets nodes re-pull a private image later. Not needed if the GHCR package is public. |
 
-| `SONAR_TOKEN` | Secret | SonarQube Cloud token. Until it's set, the scan is skipped with a warning. |
+```bash
+gh variable set SONAR_HOST_URL --body "$(terraform -chdir=terraform output -raw sonarqube_url)"
+gh secret set SONAR_TOKEN < ansible/credentials/sonar_token
+```
 
-`GITHUB_TOKEN` (built in) is used to push to GHCR, so no AWS keys are needed in GitHub.
+## 6. SonarQube
 
-## 6. SonarQube Cloud (code quality)
+SonarQube Community runs self-hosted on the tools server at http://15.252.117.69:9000, backed by PostgreSQL. Each CI run uploads the code and `coverage.xml` to project `agentic-ids`, then waits for the **Sonar way** quality gate. The dashboard shows bugs, vulnerabilities, security hotspots, code smells, duplication and coverage.
 
-1. Sign in at https://sonarcloud.io with GitHub, then choose **+ → Analyze new project** and import `agentic-ids`.
-2. In the project, go to **Administration → Analysis Method** and turn **off Automatic Analysis**, since CI does the analysis.
-3. Go to **My Account → Security** and generate a token. Add it as the `SONAR_TOKEN` repository secret.
-4. If the organization or project keys differ from the ones in `sonar-project.properties`, update them.
+## 7. Monitoring and alerts
 
-Each push then sends bugs, vulnerabilities, code smells, duplication and test coverage (from `pytest --cov`) to the SonarQube dashboard. The pipeline waits for the quality gate.
+**Prometheus** scrapes every 15s:
 
-## 7. Email alerts (CloudWatch → SNS)
-
-`terraform/alerts.tf` creates:
-
-| Alarm | Fires when | Email |
+| Job | Source | What it shows |
 |---|---|---|
-| `agentic-ids-cpu-above-80pct` | Average EC2 CPU > 80% over 5 minutes | ALARM, then OK when it recovers |
-| `agentic-ids-status-check-failed` | EC2 instance/system status check fails for 2 minutes | ALARM, then OK |
+| `node` | node_exporter on all 3 instances | CPU, memory, disk, network |
+| `kube-state-metrics` | NodePort 30080 on the cluster | Deployment replicas, pod restarts, which node each pod is on |
+| `app` | Blackbox probe of http://13.203.254.194/_stcore/health | Public uptime and response time |
+| `app_nodes` | Blackbox probe of each node's Traefik | Whether each node serves the app |
 
-Set `alert_email` in `terraform.tfvars` and run `terraform apply`. **AWS then emails a confirmation link, and you must click it before any alerts arrive.** It uses free basic EC2 metrics, so there's no agent on the server.
+**Grafana** provisions two dashboards automatically:
+- **Agentic IDS - Overview** (the home dashboard): app up/down, instances up, replicas available, firing alerts, CPU per instance with the 80% line, memory, response time, network, pod restarts, and which node each pod is on.
+- **Node Exporter Full**: the standard community dashboard, with detailed per-host metrics.
 
-To test without loading the CPU:
+**Alert rules** (`ansible/monitoring/alert-rules.yml`) go to Alertmanager, which sends email:
 
-```bash
-aws cloudwatch set-alarm-state --region ap-south-1 --alarm-name agentic-ids-cpu-above-80pct \
-  --state-value ALARM --state-reason "Manual test"
-```
-
-To test with real load, run this on the server (high CPU for 6 minutes; the alarm fires within about 10 minutes):
-
-```bash
-sudo apt-get install -y stress-ng && stress-ng --cpu 2 --timeout 360s
-```
-
-## Public application URL
-
-| | |
+| Alert | Condition |
 |---|---|
-| URL | http://13.203.254.194 |
-| Health | http://13.203.254.194/_stcore/health → `ok` |
-| SSH | `ssh -i ~/.ssh/agentic-ids ubuntu@13.203.254.194` |
+| `HighCPUUsage` | CPU > **80%** for 5 minutes on any instance |
+| `HighMemoryUsage` | Memory > 90% for 5 minutes |
+| `DiskSpaceLow` | Less than 10% free on `/` |
+| `InstanceDown` | node_exporter unreachable for 2 minutes |
+| `AppEndpointDown` | Public dashboard failing health checks for 2 minutes |
+| `AppReplicasUnavailable` | Fewer available replicas than desired for 5 minutes |
+| `PodRestartingOften` | More than 3 restarts in 15 minutes |
+
+**Enable email:** create a Gmail [App Password](https://myaccount.google.com/apppasswords) (needs 2-Step Verification) for the `alert_email` account, then:
+
+```bash
+printf '%s' '<16-char app password>' > ansible/credentials/smtp_password
+ansible-playbook playbook.yml --tags monitoring
+```
+
+Alerts also show up in Grafana, Prometheus (`/alerts`) and Alertmanager without email.
+
+**Demo: trigger the CPU alert.** Run this on any instance. The alert goes *pending* after about 1 minute and *firing* (and emails) after 5:
+
+```bash
+sudo apt-get install -y stress-ng && stress-ng --cpu 2 --timeout 420s
+```
 
 ## Troubleshooting
 
 ```bash
-# On the server
-kubectl get nodes
-kubectl -n agentic-ids get deploy,pods,svc,ingress
-kubectl -n agentic-ids describe pod -l app=agentic-ids
-kubectl -n agentic-ids logs deploy/agentic-ids --tail=100
-kubectl -n kube-system get pods                   # traefik, coredns
-sudo systemctl status k3s; sudo journalctl -u k3s -n 100
+# K3s server
+kubectl get nodes -o wide
+kubectl -n agentic-ids get deploy,pods,svc,ingress -o wide
+kubectl -n agentic-ids logs -l app=agentic-ids --tail=100
+sudo journalctl -u k3s -n 100            # on the worker: sudo journalctl -u k3s-agent -n 100
+
+# Tools server
+cd /opt/monitoring && sudo docker compose ps
+sudo docker compose logs --tail=100 sonarqube   # or prometheus, grafana, alertmanager
 
 # From your machine
-curl -i http://<EC2_IP>/_stcore/health
+curl -i http://13.203.254.194/_stcore/health
 ```
 
 | Symptom | Likely cause |
 |---|---|
-| `ImagePullBackOff` | The GHCR package is private and the pull token expired. Make the package public or set `GHCR_PULL_TOKEN`. |
-| `OOMKilled` / pod restarts | A very large CSV upload. Use `instance_type = "t3.medium"` and raise the memory limit. |
-| 404 from Traefik | The Ingress or Service is missing. Re-run the deploy job. |
-| CI deploy step can't SSH | `EC2_HOST`/`EC2_SSH_KEY` is wrong, or `ssh_allowed_cidrs` excludes GitHub runners. |
+| Worker `NotReady` | Security group self-rule missing, or the token/version is wrong. Check `journalctl -u k3s-agent`. |
+| File upload fails or the session resets | Sticky cookie blocked. Check the `ids_affinity` cookie and the Service annotations. |
+| `ImagePullBackOff` on a node | Private GHCR package and the pull token expired. Make the package public or set `GHCR_PULL_TOKEN`. |
+| SonarQube container exits | Low memory or `vm.max_map_count`. Re-run `--tags monitoring` and check `docker compose logs sonarqube`. |
+| CI SonarQube step times out | The tools server is down, or `SONAR_HOST_URL`/`SONAR_TOKEN` is wrong. |
+| No alert emails | No SMTP password set, or the Gmail App Password is wrong. Check `docker compose logs alertmanager`. |
 
 ## Cleanup
 
 ```bash
 cd terraform
-terraform destroy          # removes the EC2 instance, Elastic IP, security group, key pair, alarms and SNS topic
+terraform destroy      # removes all 3 instances, Elastic IPs, security groups and the key pair
 ```
 
 You can also delete the `agentic-ids` package under GitHub → Packages.
 
 ## Security trade-offs and limitations
 
-- **HTTP only.** There's no domain or TLS, to avoid extra cost and services. Don't upload sensitive data.
-- **SSH (22) is open to 0.0.0.0/0** because GitHub-hosted runners deploy from changing IPs. Password and root login are disabled, and access is key-only. For manual-only deploys, set `ssh_allowed_cidrs = ["<your-ip>/32"]`.
-- Only ports **22** and **80** are open. The Kubernetes API (6443) isn't reachable from the internet.
-- **Tests:** the repo had none originally. `tests/test_smoke.py` checks that the agent pipeline runs end to end on synthetic data. It doesn't measure detection accuracy.
-- `main.py` isn't part of the deployment. It calls `utils.preprocess.load_data`, which doesn't exist, and expects a local `data/` folder.
-- **Cost:** about US$0.7/day (t3.small + 20 GB gp3 + public IPv4 in ap-south-1). Run `terraform destroy` after the demo.
+- **HTTP only.** No domain or TLS, to avoid extra cost. Grafana and SonarQube logins travel unencrypted, so use generated passwords and don't reuse them.
+- **SSH (22) is open to 0.0.0.0/0** because GitHub-hosted runners deploy from changing IPs. Access is key-only, with password and root login disabled.
+- **SonarQube (9000) is public**, because CI runners must reach it. It requires login, and the default admin password is replaced automatically.
+- **Prometheus and Alertmanager** have no login, so they're limited to `admin_cidrs`.
+- **Cluster ports stay private.** The K3s API (6443), kubelet, flannel, node_exporter and kube-state-metrics accept traffic only from inside the cluster or tools security groups.
+- **Single control plane.** The worker adds app redundancy, but if the server node goes down, the cluster can't be managed until it returns. A highly available control plane would need 3 server nodes.
+- **Tests:** `tests/test_smoke.py` checks that the agent pipeline runs end to end on synthetic data. It doesn't measure detection accuracy.
+- `main.py` isn't part of the deployment. It calls `utils.preprocess.load_data`, which doesn't exist.
+- **Cost:** about US$3.6/day (2× t3.small + c7i-flex.large + 70 GB gp3 + 3 public IPv4). Run `terraform destroy` after the demo.

@@ -44,6 +44,32 @@ resource "aws_security_group" "app" {
     cidr_blocks = var.http_allowed_cidrs
   }
 
+  # Node-to-node cluster traffic (K3s API 6443, flannel VXLAN 8472/udp,
+  # kubelet 10250) stays inside this security group, never the internet.
+  ingress {
+    description = "K3s cluster traffic between nodes"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    self        = true
+  }
+
+  ingress {
+    description     = "Prometheus scraping node_exporter"
+    from_port       = 9100
+    to_port         = 9100
+    protocol        = "tcp"
+    security_groups = [aws_security_group.tools.id]
+  }
+
+  ingress {
+    description     = "Prometheus scraping kube-state-metrics (NodePort)"
+    from_port       = 30080
+    to_port         = 30080
+    protocol        = "tcp"
+    security_groups = [aws_security_group.tools.id]
+  }
+
   egress {
     description = "All outbound (apt, K3s install, GHCR image pulls)"
     from_port   = 0
@@ -79,6 +105,34 @@ resource "aws_instance" "app" {
 
   lifecycle {
     ignore_changes = [ami] # don't replace the server when Canonical publishes a new AMI
+  }
+}
+
+# K3s worker node(s): join the server over the private network and run app replicas.
+resource "aws_instance" "worker" {
+  count                  = var.worker_count
+  ami                    = var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu.id
+  instance_type          = var.worker_instance_type
+  key_name               = aws_key_pair.deployer.key_name
+  vpc_security_group_ids = [aws_security_group.app.id]
+
+  root_block_device {
+    volume_type = "gp3"
+    volume_size = var.root_volume_size
+    encrypted   = true
+  }
+
+  metadata_options {
+    http_tokens = "required"
+  }
+
+  tags = {
+    Name = "${var.instance_name}-worker-${count.index + 1}"
+    Role = "k3s-agent"
+  }
+
+  lifecycle {
+    ignore_changes = [ami]
   }
 }
 

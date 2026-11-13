@@ -1,0 +1,74 @@
+# Managed by Ansible. Targets come from the Terraform-generated inventory.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alert-rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Host metrics (CPU, memory, disk, network) from node_exporter on every instance.
+  - job_name: node
+    static_configs:
+{% for host in groups['k3s_server'] %}
+      - targets: ["{{ hostvars[host].private_ip }}:9100"]
+        labels: { instance: k3s-server, role: k3s-server }
+{% endfor %}
+{% for host in groups['k3s_agents'] %}
+      - targets: ["{{ hostvars[host].private_ip }}:9100"]
+        labels: { instance: k3s-worker-{{ loop.index }}, role: k3s-agent }
+{% endfor %}
+{% for host in groups['monitoring'] %}
+      - targets: ["{{ hostvars[host].private_ip }}:9100"]
+        labels: { instance: tools, role: monitoring }
+{% endfor %}
+
+  # Kubernetes object state (deployments, pods, nodes) via NodePort.
+  - job_name: kube-state-metrics
+    static_configs:
+      - targets: ["{{ hostvars[groups['k3s_server'][0]].private_ip }}:30080"]
+
+  # Is the dashboard reachable from the internet (public Elastic IP)?
+  - job_name: app
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs:
+      - targets: ["http://{{ app_public_ip }}/_stcore/health"]
+        labels: { instance: public-url }
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: url
+      - target_label: __address__
+        replacement: blackbox:9115
+
+  # Does each K3s node serve the dashboard through its own Traefik?
+  - job_name: app_nodes
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs:
+{% for host in groups['k3s_server'] %}
+      - targets: ["http://{{ hostvars[host].private_ip }}/_stcore/health"]
+        labels: { instance: k3s-server }
+{% endfor %}
+{% for host in groups['k3s_agents'] %}
+      - targets: ["http://{{ hostvars[host].private_ip }}/_stcore/health"]
+        labels: { instance: k3s-worker-{{ loop.index }} }
+{% endfor %}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: url
+      - target_label: __address__
+        replacement: blackbox:9115

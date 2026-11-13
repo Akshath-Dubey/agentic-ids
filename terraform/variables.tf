@@ -63,3 +63,39 @@ variable "cpu_alarm_threshold" {
   type        = number
   default     = 80
 }
+
+variable "enable_cloudwatch_alerts" {
+  description = "Create the CloudWatch/SNS email alarms (needs sns:* and cloudwatch alarm permissions on the IAM user). Prometheus Alertmanager emails CPU alerts independently."
+  type        = bool
+  default     = false
+}
+
+variable "worker_count" {
+  description = "Number of K3s worker (agent) nodes."
+  type        = number
+  default     = 1
+}
+
+variable "worker_instance_type" {
+  description = "EC2 instance type for K3s worker nodes."
+  type        = string
+  default     = "t3.small"
+}
+
+variable "tools_instance_type" {
+  description = "EC2 instance type for the Prometheus/Grafana/SonarQube server. SonarQube needs ~2 GiB on its own, so 4 GiB (t3.medium or c7i-flex.large on Free Tier accounts) is the minimum."
+  type        = string
+  default     = "c7i-flex.large"
+}
+
+variable "tools_volume_size" {
+  description = "Root volume size (GiB) for the tools server."
+  type        = number
+  default     = 30
+}
+
+variable "admin_cidrs" {
+  description = "CIDRs allowed to open the Prometheus (9090) and Alertmanager (9093) UIs. Grafana and SonarQube have their own logins and are public."
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}

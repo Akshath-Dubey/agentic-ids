@@ -1,37 +1,34 @@
 ---
-# Configures the single EC2 host as a K3s node and deploys Agentic IDS onto it.
+# Agentic IDS: configures all EC2 instances and deploys the app.
 #
-#   Full setup + deploy:  ansible-playbook playbook.yml -e app_image=ghcr.io/<owner>/agentic-ids:<tag>
-#   Server setup only:    ansible-playbook playbook.yml --tags setup
-#   Deploy only (CI):     ansible-playbook playbook.yml --tags deploy -e app_image=... -e upgrade_packages=false
+#   Inventory groups (from `terraform output -raw ansible_inventory`):
+#     k3s_server  - K3s control plane + app replica (Elastic IP = dashboard URL)
+#     k3s_agents  - K3s worker node(s) running app replicas
+#     monitoring  - Prometheus, Alertmanager, Grafana, SonarQube (Docker Compose)
 #
-# Optional for private GHCR images: -e ghcr_username=<user> -e ghcr_token=<token>
+#   Everything:          ansible-playbook playbook.yml -e app_image=ghcr.io/<owner>/agentic-ids:<tag>
+#   Servers only:        ansible-playbook playbook.yml --tags setup
+#   Monitoring only:     ansible-playbook playbook.yml --tags monitoring
+#   App deploy (CI):     ansible-playbook playbook.yml --tags deploy -e app_image=... -e upgrade_packages=false
+#
+# Optional: -e ghcr_username=<user> -e ghcr_token=<token>  (private GHCR image)
+#           ALERT_SMTP_PASSWORD env var or credentials/smtp_password  (Alertmanager email)
+# Generated passwords/tokens are stored in ansible/credentials/ (git-ignored).
 
-- name: Configure K3s host and deploy Agentic IDS
-  hosts: k3s
+# ---------------------------------------------------------------------------
+- name: Common setup for all instances
+  hosts: all
   become: true
-
   vars:
     upgrade_packages: true
-    k3s_channel: stable
-    swap_size: 2G
-    app_namespace: agentic-ids
-    manifest_dir: /opt/agentic-ids/k8s
-    kubectl: /usr/local/bin/k3s kubectl
-    manifests:
-      - namespace.yaml
-      - configmap.yaml
-      - deployment.yaml
-      - service.yaml
-      - ingress.yaml
-
+    swap_size: "{{ '4G' if 'monitoring' in group_names else '2G' }}"
+    node_exporter_version: "1.12.1"
   tasks:
-    # ---------------- Server setup ----------------
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 3600
-      tags: [setup, deploy]
+      tags: [setup, monitoring]
 
     - name: Upgrade installed packages (safe)
       ansible.builtin.apt:
@@ -57,7 +54,6 @@
       notify: Restart ssh
       tags: setup
 
-    # Small instances (t3.small = 2 GiB) need swap headroom for K3s + model training.
     - name: Create swapfile
       ansible.builtin.command: fallocate -l {{ swap_size }} /swapfile
       args:
@@ -77,6 +73,88 @@
         line: /swapfile none swap sw 0 0
       tags: setup
 
+    # node_exporter: host metrics for Prometheus (port 9100, reachable only
+    # from the tools server via the security group).
+    - name: Create node_exporter user
+      ansible.builtin.user:
+        name: node_exporter
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+      tags: [setup, monitoring]
+
+    - name: Download node_exporter
+      ansible.builtin.get_url:
+        url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        dest: "/tmp/node_exporter-{{ node_exporter_version }}.tar.gz"
+        checksum: "sha256:https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/sha256sums.txt"
+        mode: "0644"
+      tags: [setup, monitoring]
+
+    - name: Unpack node_exporter
+      ansible.builtin.unarchive:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.tar.gz"
+        dest: /opt
+        remote_src: true
+        creates: "/opt/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+      tags: [setup, monitoring]
+
+    - name: Install node_exporter binary
+      ansible.builtin.copy:
+        src: "/opt/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+        dest: /usr/local/bin/node_exporter
+        remote_src: true
+        mode: "0755"
+      notify: Restart node_exporter
+      tags: [setup, monitoring]
+
+    - name: node_exporter systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/node_exporter.service
+        content: |
+          [Unit]
+          Description=Prometheus node_exporter
+          After=network-online.target
+
+          [Service]
+          User=node_exporter
+          ExecStart=/usr/local/bin/node_exporter --web.listen-address=:9100 --collector.filesystem.mount-points-exclude=^/(dev|proc|run|sys|var/lib/(docker|kubelet|rancher)/.+)($|/)
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: "0644"
+      notify: Restart node_exporter
+      tags: [setup, monitoring]
+
+    - name: Enable node_exporter
+      ansible.builtin.systemd:
+        name: node_exporter
+        state: started
+        enabled: true
+        daemon_reload: true
+      tags: [setup, monitoring]
+
+  handlers:
+    - name: Restart ssh
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
+
+    - name: Restart node_exporter
+      ansible.builtin.systemd:
+        name: node_exporter
+        state: restarted
+        daemon_reload: true
+
+# ---------------------------------------------------------------------------
+- name: K3s server (control plane)
+  hosts: k3s_server
+  become: true
+  vars:
+    k3s_channel: stable
+    kubectl: /usr/local/bin/k3s kubectl
+  tasks:
     - name: Download K3s install script
       ansible.builtin.get_url:
         url: https://get.k3s.io
@@ -84,7 +162,7 @@
         mode: "0755"
       tags: setup
 
-    - name: Install K3s (single-node server)
+    - name: Install K3s server
       ansible.builtin.command: /usr/local/bin/k3s-install.sh
       environment:
         INSTALL_K3S_CHANNEL: "{{ k3s_channel }}"
@@ -128,10 +206,88 @@
         line: "KUBECONFIG=/home/{{ ansible_user }}/.kube/config"
       tags: setup
 
-    - name: Wait for the Kubernetes node to be Ready
-      ansible.builtin.command: "{{ kubectl }} wait --for=condition=Ready node --all --timeout=180s"
+    - name: Read the K3s version (agents install the same one)
+      ansible.builtin.shell: set -o pipefail && /usr/local/bin/k3s --version | head -1 | awk '{print $3}'
+      args:
+        executable: /bin/bash
+      register: k3s_version
+      changed_when: false
+      tags: setup
+
+    - name: Read the node join token
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token_raw
+      no_log: true
+      tags: setup
+
+    - name: Share join details with the agent play
+      ansible.builtin.set_fact:
+        k3s_token: "{{ k3s_token_raw.content | b64decode | trim }}"
+        k3s_server_version: "{{ k3s_version.stdout }}"
+      no_log: true
+      tags: setup
+
+# ---------------------------------------------------------------------------
+- name: K3s agents (worker nodes)
+  hosts: k3s_agents
+  become: true
+  vars:
+    server: "{{ groups['k3s_server'][0] }}"
+  tasks:
+    - name: Download K3s install script
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /usr/local/bin/k3s-install.sh
+        mode: "0755"
+      tags: setup
+
+    - name: Install K3s agent and join the cluster over the private network
+      ansible.builtin.command: /usr/local/bin/k3s-install.sh
+      environment:
+        INSTALL_K3S_VERSION: "{{ hostvars[server].k3s_server_version }}"
+        INSTALL_K3S_EXEC: "agent --kubelet-arg=fail-swap-on=false"
+        K3S_URL: "https://{{ hostvars[server].private_ip }}:6443"
+        K3S_TOKEN: "{{ hostvars[server].k3s_token }}"
+      args:
+        creates: /usr/local/bin/k3s
+      no_log: true
+      tags: setup
+
+    - name: Ensure K3s agent is enabled and running
+      ansible.builtin.systemd:
+        name: k3s-agent
+        state: started
+        enabled: true
+      tags: setup
+
+# ---------------------------------------------------------------------------
+- name: Cluster checks and in-cluster monitoring
+  hosts: k3s_server
+  become: true
+  vars:
+    kubectl: /usr/local/bin/k3s kubectl
+    expected_nodes: "{{ (groups['k3s_server'] | length) + (groups['k3s_agents'] | default([]) | length) }}"
+  tasks:
+    - name: Wait for all nodes to be Ready
+      ansible.builtin.shell: set -o pipefail && {{ kubectl }} get nodes --no-headers | awk '$2=="Ready"' | wc -l
+      args:
+        executable: /bin/bash
+      register: ready_nodes
+      until: ready_nodes.stdout | int >= expected_nodes | int
+      retries: 30
+      delay: 10
       changed_when: false
       tags: [setup, deploy]
+
+    - name: Label worker nodes
+      ansible.builtin.command: >-
+        {{ kubectl }} label node {{ hostvars[item].ansible_hostname }}
+        node-role.kubernetes.io/worker=worker --overwrite
+      loop: "{{ groups['k3s_agents'] | default([]) }}"
+      register: label
+      changed_when: "'labeled' in label.stdout and 'not labeled' not in label.stdout"
+      tags: setup
 
     - name: Wait for Traefik ingress controller
       ansible.builtin.command: "{{ kubectl }} -n kube-system rollout status deployment/traefik --timeout=300s"
@@ -141,6 +297,19 @@
       until: traefik.rc == 0
       changed_when: false
       tags: [setup, deploy]
+
+    - name: Copy kube-state-metrics manifest
+      ansible.builtin.copy:
+        src: ../k8s/monitoring/kube-state-metrics.yaml
+        dest: /opt/agentic-ids/kube-state-metrics.yaml
+        mode: "0640"
+      tags: [setup, monitoring]
+
+    - name: Deploy kube-state-metrics
+      ansible.builtin.command: "{{ kubectl }} apply -f /opt/agentic-ids/kube-state-metrics.yaml"
+      register: ksm
+      changed_when: "'configured' in ksm.stdout or 'created' in ksm.stdout"
+      tags: [setup, monitoring]
 
     - name: Show node status
       ansible.builtin.command: "{{ kubectl }} get nodes -o wide"
@@ -153,7 +322,21 @@
         var: nodes.stdout_lines
       tags: [setup, deploy]
 
-    # ---------------- Application deploy ----------------
+# ---------------------------------------------------------------------------
+- name: Deploy Agentic IDS
+  hosts: k3s_server
+  become: true
+  vars:
+    app_namespace: agentic-ids
+    manifest_dir: /opt/agentic-ids/k8s
+    kubectl: /usr/local/bin/k3s kubectl
+    manifests:
+      - namespace.yaml
+      - configmap.yaml
+      - deployment.yaml
+      - service.yaml
+      - ingress.yaml
+  tasks:
     - name: Require app_image for deployment
       ansible.builtin.assert:
         that: app_image is defined and app_image | length > 0
@@ -225,13 +408,305 @@
       until: health.status == 200
       tags: deploy
 
-    - name: Deployment result
-      ansible.builtin.debug:
-        msg: "Agentic IDS ({{ app_image }}) is live at http://{{ ansible_host | default(inventory_hostname) }}"
+    - name: Show app pods
+      ansible.builtin.command: "{{ kubectl }} -n {{ app_namespace }} get pods -o wide"
+      register: pods
+      changed_when: false
       tags: deploy
 
-  handlers:
-    - name: Restart ssh
+    - name: Deployment result
+      ansible.builtin.debug:
+        msg:
+          - "Agentic IDS ({{ app_image }}) is live at http://{{ ansible_host | default(inventory_hostname) }}"
+          - "{{ pods.stdout_lines }}"
+      tags: deploy
+
+# ---------------------------------------------------------------------------
+- name: Tools server - Prometheus, Alertmanager, Grafana, SonarQube
+  hosts: monitoring
+  become: true
+  vars:
+    stack_dir: /opt/monitoring
+    prometheus_version: v3.16.0
+    alertmanager_version: v0.35.0
+    blackbox_version: v0.29.1
+    grafana_version: "13.3.1"
+    sonarqube_version: 26.10.0.133078-community
+    postgres_version: 17.12-alpine
+    smtp_host: smtp.gmail.com:587
+    smtp_password: >-
+      {{ lookup('ansible.builtin.env', 'ALERT_SMTP_PASSWORD')
+         or lookup('ansible.builtin.file', playbook_dir ~ '/credentials/smtp_password', errors='ignore')
+         or '' }}
+    grafana_admin_password: "{{ lookup('ansible.builtin.password', playbook_dir ~ '/credentials/grafana_admin_password length=24 chars=ascii_letters,digits') }}"
+    sonar_db_password: "{{ lookup('ansible.builtin.password', playbook_dir ~ '/credentials/sonar_db_password length=24 chars=ascii_letters,digits') }}"
+    # SonarQube requires upper, lower, digit and a special character.
+    sonar_admin_password: "{{ lookup('ansible.builtin.password', playbook_dir ~ '/credentials/sonar_admin_password length=20 chars=ascii_letters,digits') }}#Aa1"
+  tasks:
+    - name: Install Docker and Compose
+      ansible.builtin.apt:
+        name: [docker.io, docker-compose-v2]
+        state: present
+      tags: [setup, monitoring]
+
+    - name: Enable Docker
       ansible.builtin.systemd:
-        name: ssh
-        state: restarted
+        name: docker
+        state: started
+        enabled: true
+      tags: [setup, monitoring]
+
+    - name: Kernel settings required by SonarQube (Elasticsearch)
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-sonarqube.conf
+        content: |
+          vm.max_map_count=524288
+          fs.file-max=131072
+        mode: "0644"
+      register: sysctl_conf
+      tags: [setup, monitoring]
+
+    - name: Apply kernel settings
+      ansible.builtin.command: sysctl --system
+      when: sysctl_conf.changed
+      changed_when: true
+      tags: [setup, monitoring]
+
+    - name: Create stack directories
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - ""
+        - prometheus
+        - alertmanager
+        - blackbox
+        - grafana/provisioning/datasources
+        - grafana/provisioning/dashboards
+        - grafana/dashboards
+      tags: [setup, monitoring]
+
+    - name: Write secrets file
+      ansible.builtin.copy:
+        dest: "{{ stack_dir }}/.env"
+        content: |
+          GRAFANA_ADMIN_PASSWORD={{ grafana_admin_password }}
+          SONAR_DB_PASSWORD={{ sonar_db_password }}
+        mode: "0600"
+      no_log: true
+      tags: [setup, monitoring]
+
+    - name: Compose file
+      ansible.builtin.template:
+        src: monitoring/docker-compose.yml.j2
+        dest: "{{ stack_dir }}/docker-compose.yml"
+        mode: "0644"
+      tags: [setup, monitoring]
+
+    - name: Prometheus config
+      ansible.builtin.template:
+        src: monitoring/prometheus.yml.j2
+        dest: "{{ stack_dir }}/prometheus/prometheus.yml"
+        mode: "0644"
+      register: prom_cfg
+      tags: [setup, monitoring]
+
+    - name: Prometheus alert rules
+      ansible.builtin.copy:
+        src: monitoring/alert-rules.yml
+        dest: "{{ stack_dir }}/prometheus/alert-rules.yml"
+        mode: "0644"
+      register: prom_rules
+      tags: [setup, monitoring]
+
+    - name: Alertmanager config (may contain the SMTP password)
+      ansible.builtin.template:
+        src: monitoring/alertmanager.yml.j2
+        dest: "{{ stack_dir }}/alertmanager/alertmanager.yml"
+        owner: "65534"
+        mode: "0600"
+      register: am_cfg
+      no_log: true
+      tags: [setup, monitoring]
+
+    - name: Blackbox exporter config
+      ansible.builtin.copy:
+        src: monitoring/blackbox.yml
+        dest: "{{ stack_dir }}/blackbox/blackbox.yml"
+        mode: "0644"
+      register: bb_cfg
+      tags: [setup, monitoring]
+
+    - name: Grafana provisioning
+      ansible.builtin.copy:
+        src: "monitoring/grafana/provisioning/{{ item }}"
+        dest: "{{ stack_dir }}/grafana/provisioning/{{ item }}"
+        mode: "0644"
+      loop:
+        - datasources/prometheus.yml
+        - dashboards/provider.yml
+      register: graf_prov
+      tags: [setup, monitoring]
+
+    - name: Grafana Agentic IDS dashboard
+      ansible.builtin.copy:
+        src: monitoring/grafana/dashboards/agentic-ids-overview.json
+        dest: "{{ stack_dir }}/grafana/dashboards/agentic-ids-overview.json"
+        mode: "0644"
+      tags: [setup, monitoring]
+
+    - name: Download "Node Exporter Full" community dashboard (grafana.com 1860)
+      ansible.builtin.get_url:
+        url: https://grafana.com/api/dashboards/1860/revisions/latest/download
+        dest: "{{ stack_dir }}/grafana/dashboards/node-exporter-full.json"
+        mode: "0644"
+        force: false
+      register: nef
+      tags: [setup, monitoring]
+
+    - name: Point the community dashboard at the provisioned Prometheus datasource
+      ansible.builtin.replace:
+        path: "{{ stack_dir }}/grafana/dashboards/node-exporter-full.json"
+        regexp: '\$\{DS_PROMETHEUS\}'
+        replace: prometheus
+      tags: [setup, monitoring]
+
+    - name: Start the stack
+      ansible.builtin.command: docker compose up -d --remove-orphans
+      args:
+        chdir: "{{ stack_dir }}"
+      register: compose_up
+      changed_when: "'Started' in compose_up.stderr or 'Recreated' in compose_up.stderr or 'Created' in compose_up.stderr"
+      tags: [setup, monitoring]
+
+    - name: Restart services whose config changed
+      ansible.builtin.command: "docker compose restart {{ item.svc }}"
+      args:
+        chdir: "{{ stack_dir }}"
+      when: item.changed
+      loop:
+        - { svc: prometheus, changed: "{{ prom_cfg.changed or prom_rules.changed }}" }
+        - { svc: alertmanager, changed: "{{ am_cfg.changed }}" }
+        - { svc: blackbox, changed: "{{ bb_cfg.changed }}" }
+        - { svc: grafana, changed: "{{ graf_prov.changed }}" }
+      loop_control:
+        label: "{{ item.svc }}"
+      changed_when: true
+      tags: [setup, monitoring]
+
+    - name: Wait for Prometheus
+      ansible.builtin.uri:
+        url: http://localhost:9090/-/ready
+      register: prom_ready
+      until: prom_ready.status == 200
+      retries: 30
+      delay: 5
+      tags: [setup, monitoring]
+
+    - name: Wait for Grafana
+      ansible.builtin.uri:
+        url: http://localhost:3000/api/health
+      register: graf_ready
+      until: graf_ready.status == 200
+      retries: 30
+      delay: 5
+      tags: [setup, monitoring]
+
+    # ---------- SonarQube bootstrap (admin password + CI token) ----------
+    - name: Wait for SonarQube to be UP (first start takes a few minutes)
+      ansible.builtin.uri:
+        url: http://localhost:9000/api/system/status
+        return_content: true
+      register: sq_status
+      until: sq_status.status == 200 and sq_status.json.status == 'UP'
+      retries: 60
+      delay: 10
+      tags: [setup, monitoring]
+
+    - name: Check whether the SonarQube admin password is already set
+      ansible.builtin.uri:
+        url: http://localhost:9000/api/authentication/validate
+        user: admin
+        password: "{{ sonar_admin_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: [200, 401]
+      register: sq_auth
+      no_log: true
+      tags: [setup, monitoring]
+
+    - name: Replace the default SonarQube admin password
+      ansible.builtin.uri:
+        url: http://localhost:9000/api/users/change_password
+        method: POST
+        user: admin
+        password: admin
+        force_basic_auth: true
+        body_format: form-urlencoded
+        body:
+          login: admin
+          previousPassword: admin
+          password: "{{ sonar_admin_password }}"
+        status_code: 204
+      when: sq_auth.status != 200 or not (sq_auth.json.valid | default(false))
+      no_log: true
+      tags: [setup, monitoring]
+
+    - name: Check for a saved CI token
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/credentials/sonar_token"
+      delegate_to: localhost
+      become: false
+      register: sq_token_file
+      tags: [setup, monitoring]
+
+    - name: Revoke any previous CI token
+      ansible.builtin.uri:
+        url: http://localhost:9000/api/user_tokens/revoke
+        method: POST
+        user: admin
+        password: "{{ sonar_admin_password }}"
+        force_basic_auth: true
+        body_format: form-urlencoded
+        body: { name: github-actions }
+        status_code: [204, 404]
+      when: not sq_token_file.stat.exists
+      no_log: true
+      tags: [setup, monitoring]
+
+    - name: Generate a CI analysis token for GitHub Actions
+      ansible.builtin.uri:
+        url: http://localhost:9000/api/user_tokens/generate
+        method: POST
+        user: admin
+        password: "{{ sonar_admin_password }}"
+        force_basic_auth: true
+        body_format: form-urlencoded
+        body: { name: github-actions, type: GLOBAL_ANALYSIS_TOKEN }
+        return_content: true
+      register: sq_token
+      when: not sq_token_file.stat.exists
+      no_log: true
+      tags: [setup, monitoring]
+
+    - name: Save the CI token locally (credentials/sonar_token, git-ignored)
+      ansible.builtin.copy:
+        content: "{{ sq_token.json.token }}"
+        dest: "{{ playbook_dir }}/credentials/sonar_token"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      when: not sq_token_file.stat.exists
+      no_log: true
+      tags: [setup, monitoring]
+
+    - name: Tools server summary
+      ansible.builtin.debug:
+        msg:
+          - "Grafana:      http://{{ tools_public_ip }}:3000  (admin / see ansible/credentials/grafana_admin_password)"
+          - "SonarQube:    http://{{ tools_public_ip }}:9000  (admin / see ansible/credentials/sonar_admin_password + '#Aa1')"
+          - "Prometheus:   http://{{ tools_public_ip }}:9090  (admin_cidrs only)"
+          - "Alertmanager: http://{{ tools_public_ip }}:9093  (admin_cidrs only)"
+          - "Alert email:  {{ 'enabled' if smtp_password | length > 0 else 'disabled - set ALERT_SMTP_PASSWORD or credentials/smtp_password' }}"
+      tags: [setup, monitoring]

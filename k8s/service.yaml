@@ -3,6 +3,12 @@ kind: Service
 metadata:
   name: agentic-ids
   namespace: agentic-ids
+  annotations:
+    # Traefik sticky sessions: keeps a browser's WebSocket and file uploads on
+    # the same replica (Streamlit session state lives in that pod's memory).
+    traefik.ingress.kubernetes.io/service.sticky.cookie: "true"
+    traefik.ingress.kubernetes.io/service.sticky.cookie.name: ids_affinity
+    traefik.ingress.kubernetes.io/service.sticky.cookie.httponly: "true"
 spec:
   type: ClusterIP
   selector:

@@ -1,3 +1,17 @@
-# Copy to inventory.ini (git-ignored) or paste `terraform output -raw ansible_inventory`.
-[k3s]
-EC2_PUBLIC_IP ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/agentic-ids
+# Generate with: terraform -chdir=../terraform output -raw ansible_inventory > inventory.ini
+# (inventory.ini is git-ignored)
+[k3s_server]
+SERVER_PUBLIC_IP private_ip=SERVER_PRIVATE_IP
+
+[k3s_agents]
+WORKER_PUBLIC_IP private_ip=WORKER_PRIVATE_IP
+
+[monitoring]
+TOOLS_PUBLIC_IP private_ip=TOOLS_PRIVATE_IP
+
+[all:vars]
+ansible_user=ubuntu
+ansible_ssh_private_key_file=~/.ssh/agentic-ids
+app_public_ip=SERVER_PUBLIC_IP
+tools_public_ip=TOOLS_PUBLIC_IP
+alert_email=you@example.com

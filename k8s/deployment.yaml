@@ -6,7 +6,9 @@ metadata:
   labels:
     app: agentic-ids
 spec:
-  replicas: 1 # Streamlit keeps session state in memory; one replica on a single node
+  # One replica per node (server + worker). Streamlit keeps session state in
+  # memory, so the Service uses sticky sessions to pin each browser to one pod.
+  replicas: 2
   revisionHistoryLimit: 3
   strategy:
     type: RollingUpdate
@@ -22,6 +24,13 @@ spec:
         app: agentic-ids
     spec:
       restartPolicy: Always
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: agentic-ids
       imagePullSecrets:
         - name: ghcr-pull
       securityContext:
@@ -51,7 +60,7 @@ spec:
               memory: 384Mi
             limits:
               cpu: "1500m"
-              memory: 1280Mi # sized for t3.small (2 GiB); raise on t3.medium
+              memory: 1280Mi # sized for t3.small nodes (2 GiB)
           startupProbe:
             httpGet:
               path: /_stcore/health

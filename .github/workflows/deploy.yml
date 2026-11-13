@@ -43,9 +43,11 @@ jobs:
       - name: Smoke test agent pipeline (with coverage)
         run: python -m pytest -q tests --cov=. --cov-report=xml:coverage.xml
 
-      - name: SonarQube Cloud scan + quality gate
+      - name: SonarQube scan + quality gate (self-hosted on the AWS tools server)
         if: env.SONAR_TOKEN != ''
         uses: SonarSource/sonarqube-scan-action@v8.4.1
+        env:
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
         with:
           args: >
             -Dsonar.qualitygate.wait=true
@@ -136,7 +138,8 @@ jobs:
           test -n "$EC2_HOST" && test -n "$EC2_SSH_KEY" || { echo "::error::Set the EC2_HOST repository variable and EC2_SSH_KEY repository secret"; exit 1; }
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/agentic-ids && chmod 600 ~/.ssh/agentic-ids
-          printf '[k3s]\n%s ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/agentic-ids\n' "$EC2_HOST" > ansible/inventory.ini
+          # Deploys only touch the K3s server; it rolls the app out to every node.
+          printf '[k3s_server]\n%s\n\n[k3s_agents]\n\n[monitoring]\n\n[all:vars]\nansible_user=ubuntu\nansible_ssh_private_key_file=~/.ssh/agentic-ids\n' "$EC2_HOST" > ansible/inventory.ini
 
       - name: Deploy with Ansible
         working-directory: ansible
